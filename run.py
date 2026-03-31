@@ -60,9 +60,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size", default=1, type=int, help="Batch size for inference"
     )
+    parser.add_argument(
+        "--geometry-only",
+        action="store_true",
+        help="Skip texture baking and export geometry-only meshes.",
+    )
     args = parser.parse_args()
 
-    # Ensure args.device contains cuda
     devices = ["cuda", "mps", "cpu"]
     if not any(args.device in device for device in devices):
         raise ValueError("Invalid device. Use cuda, mps or cpu")
@@ -124,6 +128,7 @@ if __name__ == "__main__":
                     bake_resolution=args.texture_resolution,
                     remesh=args.remesh_option,
                     vertex_count=args.target_vertex_count,
+                    geometry_only=args.geometry_only,
                 )
         if torch.cuda.is_available():
             print("Peak Memory:", torch.cuda.max_memory_allocated() / 1024 / 1024, "MB")

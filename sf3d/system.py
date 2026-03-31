@@ -31,14 +31,16 @@ from sf3d.utils import create_intrinsic_from_fov_deg, default_cond_c2w, get_devi
 
 try:
     from texture_baker import TextureBaker
+    HAS_TEXTURE_BAKER = True
 except ImportError:
     import logging
 
     logging.warning(
-        "Could not import texture_baker. Please install it via `pip install texture-baker/`"
+        "Could not import texture_baker. Full textured export is unavailable. "
+        "Geometry-only mode will still work."
     )
-    # Exit early to avoid further errors
-    raise ImportError("texture_baker not found")
+    TextureBaker = None
+    HAS_TEXTURE_BAKER = False
 
 
 class SF3D(BaseModule):
@@ -145,7 +147,7 @@ class SF3D(BaseModule):
             ),
         )
 
-        self.baker = TextureBaker()
+        self.baker = TextureBaker() if HAS_TEXTURE_BAKER else None
         self.image_processor = ImageProcessor()
 
     def triplane_to_meshes(
@@ -184,7 +186,6 @@ class SF3D(BaseModule):
     ) -> Float[Tensor, "*B N F"]:
         batched = positions.ndim == 3
         if not batched:
-            # no batch dimension
             triplanes = triplanes[None, ...]
             positions = positions[None, ...]
         assert triplanes.ndim == 5 and positions.ndim == 3
@@ -208,7 +209,6 @@ class SF3D(BaseModule):
         return out
 
     def get_scene_codes(self, batch) -> Float[Tensor, "B 3 C H W"]:
-        # if batch[rgb_cond] is only one view, add a view dimension
         if len(batch["rgb_cond"].shape) == 4:
             batch["rgb_cond"] = batch["rgb_cond"].unsqueeze(1)
             batch["mask_cond"] = batch["mask_cond"].unsqueeze(1)
@@ -249,6 +249,7 @@ class SF3D(BaseModule):
         remesh: Literal["none", "triangle", "quad"] = "none",
         vertex_count: int = -1,
         estimate_illumination: bool = False,
+        geometry_only: bool = False,
     ) -> Tuple[Union[trimesh.Trimesh, List[trimesh.Trimesh]], dict[str, Any]]:
         if isinstance(image, list):
             rgb_cond = []
@@ -284,7 +285,12 @@ class SF3D(BaseModule):
         }
 
         meshes, global_dict = self.generate_mesh(
-            batch, bake_resolution, remesh, vertex_count, estimate_illumination
+            batch,
+            bake_resolution,
+            remesh,
+            vertex_count,
+            estimate_illumination,
+            geometry_only=geometry_only,
         )
         if batch_size == 1:
             return meshes[0], global_dict
@@ -321,6 +327,7 @@ class SF3D(BaseModule):
         remesh: Literal["none", "triangle", "quad"] = "none",
         vertex_count: int = -1,
         estimate_illumination: bool = False,
+        geometry_only: bool = False,
     ) -> Tuple[List[trimesh.Trimesh], dict[str, Any]]:
         batch["rgb_cond"] = self.image_processor(
             batch["rgb_cond"], self.cfg.cond_image_size
@@ -347,7 +354,6 @@ class SF3D(BaseModule):
 
                 rets = []
                 for i, mesh in enumerate(meshes):
-                    # Check for empty mesh
                     if mesh.v_pos.shape[0] == 0:
                         rets.append(trimesh.Trimesh())
                         continue
@@ -363,9 +369,37 @@ class SF3D(BaseModule):
                             )
 
                     print("After Remesh", mesh.v_pos.shape[0], mesh.t_pos_idx.shape[0])
+
+                    verts_np = convert_data(mesh.v_pos)
+                    faces = convert_data(mesh.t_pos_idx)
+
+                    if geometry_only:
+                        tmesh = trimesh.Trimesh(
+                            vertices=verts_np,
+                            faces=faces,
+                            process=False,
+                        )
+                        rot = trimesh.transformations.rotation_matrix(
+                            np.radians(-90), [1, 0, 0]
+                        )
+                        tmesh.apply_transform(rot)
+                        tmesh.apply_transform(
+                            trimesh.transformations.rotation_matrix(
+                                np.radians(90), [0, 1, 0]
+                            )
+                        )
+                        tmesh.invert()
+                        rets.append(tmesh)
+                        continue
+
+                    if self.baker is None:
+                        raise RuntimeError(
+                            "texture_baker is required for textured export. "
+                            "Use geometry_only=True to skip baking."
+                        )
+
                     mesh.unwrap_uv()
 
-                    # Build textures
                     rast = self.baker.rasterize(
                         mesh.v_tex, mesh.t_pos_idx, bake_resolution
                     )
@@ -391,7 +425,6 @@ class SF3D(BaseModule):
                     gb_nrm = F.normalize(nrm[bake_mask], dim=-1)
                     decoded["normal"] = gb_nrm
 
-                    # Check if any keys in global_dict start with decoded_
                     for k, v in global_dict.items():
                         if k.startswith("decoder_"):
                             decoded[k.replace("decoder_", "")] = v[i]
@@ -408,7 +441,6 @@ class SF3D(BaseModule):
                         if v is None:
                             continue
                         if v.shape[0] == 1:
-                            # Skip and directly add a single value
                             mat_out[k] = v[0]
                         else:
                             f = torch.zeros(
@@ -421,8 +453,6 @@ class SF3D(BaseModule):
                             if v.shape == f.shape:
                                 continue
                             if k == "normal":
-                                # Use un-normalized tangents here so that larger smaller tris
-                                # Don't effect the tangents that much
                                 tng = self.baker.interpolate(
                                     mesh.v_tng,
                                     rast,
@@ -435,7 +465,6 @@ class SF3D(BaseModule):
                                 )
                                 normal = F.normalize(mat_out["normal"], dim=-1)
 
-                                # Create tangent space matrix and transform normal
                                 tangent_matrix = torch.stack(
                                     [gb_tng, gb_btng, gb_nrm], dim=-1
                                 )
@@ -443,7 +472,6 @@ class SF3D(BaseModule):
                                     tangent_matrix.transpose(1, 2), normal.unsqueeze(-1)
                                 ).squeeze(-1)
 
-                                # Convert from [-1,1] to [0,1] range for storage
                                 normal_tangent = (normal_tangent * 0.5 + 0.5).clamp(
                                     0, 1
                                 )
@@ -468,8 +496,6 @@ class SF3D(BaseModule):
                             .contiguous()
                         )
 
-                    verts_np = convert_data(mesh.v_pos)
-                    faces = convert_data(mesh.t_pos_idx)
                     uvs = convert_data(mesh.v_tex)
 
                     basecolor_tex = Image.fromarray(
@@ -489,15 +515,12 @@ class SF3D(BaseModule):
                             float32_to_uint8_np(
                                 bump_np,
                                 dither=True,
-                                # Do not dither if something is perfectly flat
                                 dither_mask=np.all(
                                     bump_np == bump_up, axis=-1, keepdims=True
                                 ).astype(np.float32),
                             )
                         ).convert("RGB")
-                        bump_tex.format = (
-                            "JPEG"  # PNG would be better but the assets are larger
-                        )
+                        bump_tex.format = "JPEG"
                     else:
                         bump_tex = None
 
